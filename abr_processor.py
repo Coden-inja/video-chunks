@@ -7,12 +7,16 @@ import platform
 import subprocess
 import shutil
 
-# --- CONFIGURATION ---
-# The "Ladder": Define your ABR qualities here
-ABR_LADDER = [
-    {"name": "1080p", "width": 1920, "height": 1080, "bitrate": "4500k"},
-    {"name": "720p",  "width": 1280, "height": 720,  "bitrate": "2500k"},
-    {"name": "480p",  "width": 854,  "height": 480,  "bitrate": "1000k"}
+# --- REFERENCE STANDARDS ---
+# We define standard tier targets here. 
+# This is NOT a hardcoded instruction list, but a "Menu" of options.
+# The script will dynamically pick from this menu based on the input video.
+REFERENCE_TIERS = [
+    {"name": "8k",    "width": 7680, "height": 4320, "bitrate": "40000k"}, 
+    {"name": "4k",    "width": 3840, "height": 2160, "bitrate": "18000k"},
+    {"name": "1440p", "width": 2560, "height": 1440, "bitrate": "10000k"},
+    {"name": "1080p", "width": 1920, "height": 1080, "bitrate": "5000k"},
+    {"name": "720p",  "width": 1280, "height": 720,  "bitrate": "2500k"}
 ]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -37,34 +41,71 @@ class ABRVideoProcessor:
         
         return {'c:v': 'libx264', 'preset': 'veryfast'}
 
-    def _get_gop_size(self, input_path):
-        """Calculates GOP for exactly 2.0s segments"""
+    def _analyze_input(self, input_path):
+        """Probes the input video to get exact dimensions and GOP target"""
         try:
             probe = ffmpeg.probe(input_path)
             video_stream = next(s for s in probe['streams'] if s['codec_type'] == 'video')
+            width = int(video_stream['width'])
+            height = int(video_stream['height'])
+            
             avg_frame_rate = video_stream.get('avg_frame_rate', '30/1')
             num, den = map(int, avg_frame_rate.split('/'))
             fps = num / den if den > 0 else 30
-            return int(round(fps * 2)) # 2 seconds
-        except:
-            return 60 # Safe fallback
+            
+            return {
+                "width": width, 
+                "height": height, 
+                "gop": int(round(fps * 2))
+            }
+        except Exception as e:
+            logger.error(f"Probe failed: {e}")
+            sys.exit(1)
+
+    def _generate_ladder(self, input_w, input_h):
+        """
+        Dynamically constructs the transcoding ladder.
+        Logic: Include any standard tier that is <= input resolution.
+        """
+        ladder = []
+        
+        # 1. Filter standard tiers
+        for tier in REFERENCE_TIERS:
+            if tier['width'] <= input_w:
+                ladder.append(tier)
+        
+        # 2. Edge Case: If input is smaller than 720p (e.g. 480p source)
+        # We ensure at least the original resolution is preserved
+        if not ladder:
+             ladder.append({
+                 "name": "original", 
+                 "width": input_w, 
+                 "height": input_h, 
+                 "bitrate": "1000k"
+             })
+             
+        return ladder
 
     def process(self, input_path, output_root):
         if not os.path.exists(input_path):
             logger.error("File not found.")
             return
 
-        # 1. Setup Folders
+        # 1. Clean & Setup
         vid_id = os.path.splitext(os.path.basename(input_path))[0]
         base_dir = os.path.join(output_root, vid_id)
+        if os.path.exists(base_dir): shutil.rmtree(base_dir)
         os.makedirs(base_dir, exist_ok=True)
 
-        gop_size = self._get_gop_size(input_path)
-        master_playlist_content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+        # 2. Analyze & Plan
+        info = self._analyze_input(input_path)
+        ladder = self._generate_ladder(info['width'], info['height'])
         
-        logger.info(f"🚀 Processing: {vid_id} (Hardware: {self.hardware_config['c:v']})")
+        logger.info(f"🚀 Input: {info['width']}x{info['height']} | Plan: {[t['name'] for t in ladder]}")
+        
+        master_playlist_content = "#EXTM3U\n#EXT-X-VERSION:3\n"
 
-        # 2. Generate Poster (Once)
+        # 3. Generate Poster
         poster_path = os.path.join(base_dir, 'poster.jpg')
         (
             ffmpeg.input(input_path)
@@ -73,19 +114,15 @@ class ABRVideoProcessor:
             .run(overwrite_output=True)
         )
 
-        # 3. Iterate through ABR Ladder
-        for variant in ABR_LADDER:
+        # 4. Execute Ladder
+        for variant in ladder:
             variant_name = variant['name']
             variant_dir = os.path.join(base_dir, variant_name)
             os.makedirs(variant_dir, exist_ok=True)
-            
             output_m3u8 = os.path.join(variant_dir, 'index.m3u8')
             
-            # Scale video (Resize)
-            # Note: We use scale=-2 to keep aspect ratio even if height is slightly off
-            logger.info(f"   • Transcoding {variant_name}...")
+            logger.info(f"   • Processing {variant_name}...")
             
-            # Build FFmpeg command
             stream = ffmpeg.input(input_path)
             stream = ffmpeg.output(
                 stream,
@@ -94,45 +131,32 @@ class ABRVideoProcessor:
                 hls_time=2,
                 hls_list_size=0,
                 hls_segment_filename=os.path.join(variant_dir, 'seg_%03d.ts'),
-                # ABR Specifics
-                vf=f"scale={variant['width']}:-2",
-                **{'b:v': variant['bitrate']}, # Target Bitrate
-                **{'maxrate': variant['bitrate']}, 
+                vf=f"scale={variant['width']}:-2", 
+                **{'b:v': variant['bitrate'], 'maxrate': variant['bitrate']},
                 **{'bufsize': str(int(variant['bitrate'].replace('k','')) * 2) + 'k'},
-                # Common HLS settings
-                g=gop_size,
-                keyint_min=gop_size,
+                g=info['gop'],
+                keyint_min=info['gop'],
                 sc_threshold=0,
                 **{'c:a': 'aac', 'b:a': '128k'},
                 **self.hardware_config
             )
             stream.run(overwrite_output=True, quiet=True)
 
-            # Append to Master Playlist logic
-            # We assume a path relative to master.m3u8
-            # BANDWIDTH is bits/sec, so 4500k -> 4500000
             bandwidth = int(variant['bitrate'].replace('k', '')) * 1000
             master_playlist_content += (
                 f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={variant['width']}x{variant['height']}\n"
                 f"{variant_name}/index.m3u8\n"
             )
 
-        # 4. Write Master Playlist
+        # 5. Write Master
         with open(os.path.join(base_dir, 'master.m3u8'), 'w') as f:
             f.write(master_playlist_content)
-
-        logger.info("✅ Done.")
-        
-        # Return easy-to-use JSON
+            
         print(json.dumps({
             "status": "success",
-            "video_id": vid_id,
             "stream_url": f"/videos/{vid_id}/master.m3u8",
             "poster_url": f"/videos/{vid_id}/poster.jpg"
         }))
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python abr_processor.py <input> <output_root>")
-        sys.exit(1)
     ABRVideoProcessor().process(sys.argv[1], sys.argv[2])
