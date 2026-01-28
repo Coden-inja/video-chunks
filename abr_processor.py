@@ -11,13 +11,13 @@ import shutil
 # The menu of standard resolutions we support.
 # The script picks from this list based on input quality.
 REFERENCE_TIERS = [
-    {"name": "8k",    "width": 7680, "height": 4320, "bitrate": "35000k"}, 
-    {"name": "4k",    "width": 3840, "height": 2160, "bitrate": "16000k"},
-    {"name": "1440p", "width": 2560, "height": 1440, "bitrate": "9000k"},
-    {"name": "1080p", "width": 1920, "height": 1080, "bitrate": "4500k"},
-    {"name": "720p",  "width": 1280, "height": 720,  "bitrate": "2000k"},
-    {"name": "480p",  "width": 854,  "height": 480,  "bitrate": "900k"}
-]
+    {"name": "8k",    "width": 7680, "height": 3840, "bitrate": "35000k"}, 
+    {"name": "4k",    "width": 3840, "height": 1920, "bitrate": "16000k"}, 
+    {"name": "1440p", "width": 2560, "height": 1280, "bitrate": "9000k"}, 
+    {"name": "1080p", "width": 1920, "height": 960,  "bitrate": "4500k"},  
+    {"name": "720p",  "width": 1280, "height": 640,  "bitrate": "2000k"}, 
+    {"name": "480p",  "width": 854,  "height": 427,  "bitrate": "900k"}   
+]   
 
 # Logging Setup: Send logs to STDERR so they don't break JSON output on STDOUT
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stderr)
@@ -79,7 +79,7 @@ class VideoProcessor:
             # logic: Only generate tiers that are smaller or equal to input
             if tier['width'] <= input_w:
                 ladder.append(tier)
-        
+        ladder.sort(key=lambda t: t['width'])
         # Fallback for weird low-res videos
         if not ladder:
              ladder.append({"name": "original", "width": input_w, "height": input_h, "bitrate": "1000k"})
