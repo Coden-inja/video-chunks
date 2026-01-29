@@ -16,7 +16,7 @@ REFERENCE_TIERS = [
     {"name": "1440p", "width": 2560, "height": 1280, "bitrate": "9000k"}, 
     {"name": "1080p", "width": 1920, "height": 960,  "bitrate": "4500k"},  
     {"name": "720p",  "width": 1280, "height": 640,  "bitrate": "2000k"}, 
-    {"name": "480p",  "width": 854,  "height": 427,  "bitrate": "900k"}   
+    {"name": "480p",  "width": 854,  "height": 426,  "bitrate": "900k"}   
 ]   
 
 # Logging Setup: Send logs to STDERR so they don't break JSON output on STDOUT
@@ -72,17 +72,26 @@ class VideoProcessor:
             logger.error(f"Probe failed: {e}")
             sys.exit(1)
 
-    def _generate_ladder(self, input_w, input_h):
+    def _generate_ladder(self, input_w, input_h, is_cpu=False):
         """Constructs the transcoding plan based on input resolution"""
         ladder = []
         for tier in REFERENCE_TIERS:
             # logic: Only generate tiers that are smaller or equal to input
             if tier['width'] <= input_w:
                 ladder.append(tier)
-        ladder.sort(key=lambda t: t['width'])
+        
         # Fallback for weird low-res videos
         if not ladder:
              ladder.append({"name": "original", "width": input_w, "height": input_h, "bitrate": "1000k"})
+        
+        # --- CHANGE START ---
+        # If we are on CPU, sort Ascending (480p -> 8k) to ensure we get playable video before a potential crash.
+        # If GPU, we stick to Descending (8k -> 480p).
+        if is_cpu:
+            ladder.sort(key=lambda x: x['width']) # Smallest first
+        else:
+            ladder.sort(key=lambda x: x['width'], reverse=True) # Largest first
+        # --- CHANGE END ---
         
         return ladder
 
@@ -98,13 +107,18 @@ class VideoProcessor:
         if os.path.exists(base_dir): shutil.rmtree(base_dir) # Clean overwrite
         os.makedirs(base_dir, exist_ok=True)
 
-        # 2. Analyze
+        # 1. ANALYZE HARDWARE MODE
+        is_cpu_mode = self.hardware_config.get('c:v') == 'libx264'
+
+        # Analyze Input and Generate Ladder
         info = self._analyze_input(input_path)
-        ladder = self._generate_ladder(info['width'], info['height'])
+        ladder = self._generate_ladder(info['width'], info['height'], is_cpu=is_cpu_mode)
         
         logger.info(f"🎬 Processing {vid_id} [{info['width']}x{info['height']}] -> {[t['name'] for t in ladder]}")
         
         master_playlist_content = "#EXTM3U\n#EXT-X-VERSION:3\n"
+
+        successful_qualities = []
 
         try:
             # 3. Generate Poster (Thumbnail)
@@ -125,55 +139,67 @@ class VideoProcessor:
                 output_m3u8 = os.path.join(variant_dir, 'index.m3u8')
                 
                 logger.info(f"   • Transcoding: {variant_name}...")
+
                 
-                # Build FFmpeg Pipeline
-                stream = ffmpeg.input(input_path)
-                stream = ffmpeg.output(
-                    stream,
-                    output_m3u8,
-                    format='hls',
-                    hls_time=2,
-                    hls_list_size=0,         # Keep all chunks
-                    hls_segment_filename=os.path.join(variant_dir, 'seg_%03d.ts'),
-                    vf=f"scale={variant['width']}:-2", # Smart scaling
-                    **{'b:v': variant['bitrate'], 'maxrate': variant['bitrate']},
-                    **{'bufsize': str(int(variant['bitrate'].replace('k','')) * 2) + 'k'},
-                    g=info['gop'],           # Perfect Keyframe alignment
-                    keyint_min=info['gop'],
-                    sc_threshold=0,          # No scene detection (Crucial for ABR)
-                    **{'c:a': 'aac', 'b:a': '128k'},
-                    **self.hardware_config   # GPU/CPU flags injected here
-                )
-                stream.run(overwrite_output=True, quiet=True)
+                try:
+                    # Build FFmpeg Pipeline
+                    stream = ffmpeg.input(input_path)
+                    stream = ffmpeg.output(
+                        stream,
+                        output_m3u8,
+                        format='hls',
+                        hls_time=2,
+                        hls_list_size=0,         # Keep all chunks
+                        hls_segment_filename=os.path.join(variant_dir, 'seg_%03d.ts'),
+                        vf=f"scale={variant['width']}:-2", # Smart scaling
+                        pix_fmt='yuv420p', # fix: 10-bit to 8-bit
+                        **{'b:v': variant['bitrate'], 'maxrate': variant['bitrate']},
+                        **{'bufsize': str(int(variant['bitrate'].replace('k','')) * 2) + 'k'},
+                        g=info['gop'],           # Perfect Keyframe alignment
+                        keyint_min=info['gop'],
+                        sc_threshold=0,          # No scene detection (Crucial for ABR)
+                        **{'c:a': 'aac', 'b:a': '128k'},
+                        **self.hardware_config   # GPU/CPU flags injected here
+                    )
+                    stream.run(overwrite_output=True, quiet=True)
+    
+                    # Append to Master Playlist memory
+                    bandwidth = int(variant['bitrate'].replace('k', '')) * 1000
+                    master_playlist_content += (
+                        f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={variant['width']}x{variant['height']}\n"
+                        f"{variant_name}/index.m3u8\n"
+                    )
+                    successful_qualities.append(variant_name)
+    
+                except ffmpeg.Error as e:
+                    # If 8K fails, log it, delete the empty folder, and CONTINUE to 4K/1080p
+                    logger.error(f"❌ Failed to transcode {variant_name}. Skipping. Error: {e.stderr.decode() if e.stderr else str(e)}")
+                    shutil.rmtree(variant_dir)
+            # --- CHANGE END ---
 
-                # Append to Master Playlist memory
-                bandwidth = int(variant['bitrate'].replace('k', '')) * 1000
-                master_playlist_content += (
-                    f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={variant['width']}x{variant['height']}\n"
-                    f"{variant_name}/index.m3u8\n"
-                )
-
+            # 4. Final Check: Did anything succeed?
+            if not successful_qualities:
+                logger.error("All transcode attempts failed.")
+                sys.exit(1)
+    
             # 5. Write Master Playlist
             with open(os.path.join(base_dir, 'master.m3u8'), 'w') as f:
                 f.write(master_playlist_content)
             
-            # 6. OUTPUT JSON (This is what your Node.js backend reads)
+            # 6. Output JSON with strictly successful qualities
             result = {
                 "status": "success",
                 "video_id": vid_id,
                 "folder_path": base_dir,
                 "master_url": f"/videos/{vid_id}/master.m3u8",
                 "poster_url": f"/videos/{vid_id}/poster.jpg",
-                "qualities_generated": [t['name'] for t in ladder]
+                "qualities_generated": successful_qualities
             }
-            print(json.dumps(result)) # Print to STDOUT
-
-        except ffmpeg.Error as e:
-            logger.error(f"FFmpeg Error: {e.stderr.decode() if e.stderr else str(e)}")
-            sys.exit(1)
-        except Exception as e:
-            logger.error(f"Script Error: {str(e)}")
-            sys.exit(1)
+            print(json.dumps(result))
+        
+            except Exception as e:
+                logger.error(f"Script Error: {str(e)}")
+                sys.exit(1)
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
