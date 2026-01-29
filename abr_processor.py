@@ -15,8 +15,7 @@ REFERENCE_TIERS = [
     {"name": "4k",    "width": 3840, "height": 1920, "bitrate": "16000k"}, 
     {"name": "1440p", "width": 2560, "height": 1280, "bitrate": "9000k"}, 
     {"name": "1080p", "width": 1920, "height": 960,  "bitrate": "4500k"},  
-    {"name": "720p",  "width": 1280, "height": 640,  "bitrate": "2000k"}, 
-    {"name": "480p",  "width": 854,  "height": 426,  "bitrate": "900k"}   
+    {"name": "720p",  "width": 1280, "height": 640,  "bitrate": "2000k"}  
 ]   
 
 # Logging Setup: Send logs to STDERR so they don't break JSON output on STDOUT
@@ -85,8 +84,8 @@ class VideoProcessor:
              ladder.append({"name": "original", "width": input_w, "height": input_h, "bitrate": "1000k"})
         
         # --- CHANGE START ---
-        # If we are on CPU, sort Ascending (480p -> 8k) to ensure we get playable video before a potential crash.
-        # If GPU, we stick to Descending (8k -> 480p).
+        # If we are on CPU, sort Ascending (720p -> 8k) to ensure we get playable video before a potential crash.
+        # If GPU, we stick to Descending (8k -> 720p).
         if is_cpu:
             ladder.sort(key=lambda x: x['width']) # Smallest first
         else:
